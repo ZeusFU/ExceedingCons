@@ -5,29 +5,44 @@ st.title("Overlapping Exposure Checker (Mini-Equivalent, Root Code Aware)")
 
 st.write(
     """
-    Upload a **fills CSV** (like `fills_export.csv`), then enter the
-    **max allowed simultaneous exposure in mini-equivalents**.
+    Upload a **fills CSV** (like `fills_export.csv`), then:
+
+    1. Choose the **Mini:Micro contract ratio** for this account (1:1, 1:5, 1:10).
+    2. Enter the **max allowed simultaneous exposure in mini-equivalents**.
 
     The app:
 
-    1. Uses the **root Code** (as per the My Funded Futures instrument list)
-       from each symbol in the CSV.
-    2. Assigns a **mini-equivalent weight** per contract based on whether the
-       product is a mini or a micro (e.g. MNQ = 0.1 mini, M6E = 0.2 mini).
-    3. Treats **MBT** and **MET** as **1 full mini** each, even though they are
-       named "Micro".
-    4. Reconstructs positions over time from fills.
-    5. Finds time intervals where:
-       - At least **two different root Codes** have open positions, and
-       - The **total mini-equivalent exposure** exceeds the max.
-    6. Shows:
-       - A summary of those intervals.
-       - A **color-coded detailed table** with both reconstructed trades
-         in each interval.
+    - Uses the **root Code** as per the My Funded Futures instrument list.
+    - Classifies each product as **mini** or **micro**.
+    - Applies mini-equivalent weights:
+        - Minis: 1.0 mini-equivalent per contract.
+        - Micros: (1 / chosen ratio) mini-equivalent per contract.
+        - **MBT** and **MET** are treated as minis for risk (weight = 1.0).
+    - Reconstructs positions over time from fills.
+    - Finds time intervals where:
+        - At least **two different root Codes** have open positions, and
+        - The **total mini-equivalent exposure** exceeds the max.
+    - Shows a summary and a **color-coded detailed table** of both reconstructed trades.
     """
 )
 
 uploaded_file = st.file_uploader("Upload fills CSV", type=["csv"])
+
+# --- User-selected Mini:Micro ratio -----------------------------------------
+ratio_option = st.selectbox(
+    "Mini : Micro contract ratio",
+    ["1:1", "1:5", "1:10"],
+    index=1,  # default to 1:5
+)
+
+if ratio_option == "1:1":
+    micro_weight_global = 1.0
+elif ratio_option == "1:5":
+    micro_weight_global = 1.0 / 5.0
+elif ratio_option == "1:10":
+    micro_weight_global = 1.0 / 10.0
+else:
+    micro_weight_global = 1.0  # fallback
 
 max_mini_equiv = st.number_input(
     "Max allowed simultaneous exposure (in mini-equivalents)",
@@ -37,106 +52,89 @@ max_mini_equiv = st.number_input(
 )
 
 # --------------------------------------------------------------------
-# Instrument metadata using ROOT Code (from MFF instrument list)
+# Root Code classification using instrument list logic
 # --------------------------------------------------------------------
-# Weight here is the "mini-equivalent" exposure per 1 contract of that root.
-# - Minis and "full-size" contracts: weight = 1.0
-# - Micros: weight < 1.0 based on true mini:micro ratio
-# - MBT and MET are treated as 1.0 mini each (per MFF rule and your note)
-INSTRUMENT_WEIGHTS = {
+# We'll classify each root as:
+#   "mini"  -> 1.0 mini-equivalent per contract
+#   "micro" -> micro_weight_global mini-equivalent per contract
+#
+# MBT and MET are treated as "mini" for risk purposes, even though
+# they are named Micro products.
+
+MINI_ROOTS = [
     # CME FX & index minis
-    "6A": 1.0,
-    "6B": 1.0,
-    "6C": 1.0,
-    "6E": 1.0,
-    "6J": 1.0,
-    "6N": 1.0,
-    "6S": 1.0,
-    "NQ": 1.0,
-    "RTY": 1.0,
-    "ES": 1.0,
-    "NKD": 1.0,
-    "HE": 1.0,
-    "LE": 1.0,
+    "6A", "6B", "6C", "6E", "6J", "6N", "6S",
+    "NQ", "RTY", "ES", "NKD",
+    "HE", "LE",
+    # Metals (full/mini)
+    "HG", "GC", "PL", "SI",
+    # Grains & equity
+    "ZC", "ZS", "ZM", "ZL", "ZW", "YM",
+    # Energies
+    "CL", "QM", "HO", "NG", "RB", "QG",
+    # Cryptos treated as minis:
+    "MBT", "MET",
+]
 
-    # Micros (true micro sizes)
-    # 6A vs M6A: tick 5.00 vs 1.00  -> ratio 5:1 -> micro = 0.2 mini
-    "M6A": 0.2,
-    # 6E vs M6E: tick 6.25 vs 1.25 -> ratio 5:1 -> micro = 0.2 mini
-    "M6E": 0.2,
-    # NQ vs MNQ: tick 5 vs 0.50    -> ratio 10:1 -> micro = 0.1 mini
-    "MNQ": 0.1,
-    # RTY vs M2K: tick 5 vs 0.50   -> ratio 10:1 -> micro = 0.1 mini
-    "M2K": 0.1,
-    # ES vs MES: tick 12.5 vs 1.25 -> ratio 10:1 -> micro = 0.1 mini
-    "MES": 0.1,
+MICRO_ROOTS = [
+    # FX & index micros
+    "M6A", "M6E",
+    "MNQ", "M2K", "MES",
+    "MYM",
+    # Metals micros
+    "MGC", "SIL",
+    # Energy micros
+    "MCL",
+]
 
-    # Cryptos (MBT/MET treated as minis)
-    "MBT": 1.0,  # Micro Bitcoin but treated as full mini for risk
-    "MET": 1.0,  # Micro Ethereum but treated as full mini per your rule
+ROOT_TYPES = {root: "mini" for root in MINI_ROOTS}
+ROOT_TYPES.update({root: "micro" for root in MICRO_ROOTS})
 
-    # COMEX metals
-    "HG": 1.0,
-    "GC": 1.0,
-    "PL": 1.0,
-    "SI": 1.0,
-    # Micro Gold: 10.0 vs 1.0 -> 0.1
-    "MGC": 0.1,
-    # Micro Silver: 25.0 vs 5.0 -> 0.2
-    "SIL": 0.2,
-
-    # CBOT grains & equity
-    "ZC": 1.0,
-    "ZS": 1.0,
-    "ZM": 1.0,
-    "ZL": 1.0,
-    "ZW": 1.0,
-    "YM": 1.0,
-    # Micro E-mini Dow: 5 vs 0.5 -> 0.1
-    "MYM": 0.1,
-
-    # NYMEX energies
-    "CL": 1.0,
-    "QM": 1.0,
-    "HO": 1.0,
-    "NG": 1.0,
-    "RB": 1.0,
-    "QG": 1.0,
-    # Micro Crude Oil: 10 vs 1 -> 0.1
-    "MCL": 0.1,
-}
-
-# Sort known roots longest-first so prefix matching prefers longer codes
-KNOWN_ROOTS = sorted(INSTRUMENT_WEIGHTS.keys(), key=len, reverse=True)
+# Known roots list for prefix matching (longest-first)
+KNOWN_ROOTS = sorted(ROOT_TYPES.keys(), key=len, reverse=True)
 
 
 def get_root_code(asset: str) -> str:
     """
     Given a symbol from the fills CSV (e.g. 'MNQZ5', 'ESM4'),
-    return the ROOT Code as defined by the instrument list (e.g. 'MNQ', 'ES').
+    return the ROOT Code as per the instrument list (e.g. 'MNQ', 'ES').
 
     Strategy:
     - Uppercase the asset string.
-    - Find the longest instrument Code from INSTRUMENT_WEIGHTS that is a prefix.
+    - Find the longest known root that is a prefix.
     - If none match, fall back to treating the entire symbol as the root.
     """
     code = str(asset).strip().upper()
     for root in KNOWN_ROOTS:
         if code.startswith(root):
             return root
-    return code  # fallback: unknown root, will default to weight 1.0
+    return code  # unknown root, treated as mini by default
 
 
-def get_instrument_weight(asset: str) -> float:
+def get_instrument_weight(asset: str, micro_weight: float) -> float:
     """
-    Return the mini-equivalent weight for a given symbol based on its root Code.
-    Unknown roots default to 1.0 mini-equivalent per contract.
+    Return the mini-equivalent weight for a given symbol based on its
+    root Code and the user-selected mini:micro ratio.
+
+    - Minis: 1.0
+    - Micros: micro_weight (1/ratio)
+    - Unknown roots: default to 1.0
     """
     root = get_root_code(asset)
-    return INSTRUMENT_WEIGHTS.get(root, 1.0)
+    type_ = ROOT_TYPES.get(root, "mini")
+    if type_ == "mini":
+        return 1.0
+    elif type_ == "micro":
+        return micro_weight
+    else:
+        return 1.0
 
 
-def find_overlapping_exposure_with_details(df: pd.DataFrame, max_mini_equiv: float):
+def find_overlapping_exposure_with_details(
+    df: pd.DataFrame,
+    max_mini_equiv: float,
+    micro_weight: float,
+):
     """
     From a fills DataFrame with columns:
         - action (Buy/Sell)
@@ -185,7 +183,7 @@ def find_overlapping_exposure_with_details(df: pd.DataFrame, max_mini_equiv: flo
                     continue
 
                 root = get_root_code(asset)
-                weight = get_instrument_weight(asset)
+                weight = get_instrument_weight(asset, micro_weight)
                 exposure = contracts * weight  # mini-equivalent exposure
 
                 snapshot[asset] = {
@@ -265,7 +263,9 @@ if uploaded_file is not None:
         st.dataframe(fills_df.head(50))
 
         intervals_summary, detail_rows, cleaned_df = find_overlapping_exposure_with_details(
-            fills_df, max_mini_equiv
+            fills_df,
+            max_mini_equiv=max_mini_equiv,
+            micro_weight=micro_weight_global,
         )
 
         st.subheader("Cleaned & time-ordered fills used for calculation")
@@ -274,20 +274,21 @@ if uploaded_file is not None:
             use_container_width=True,
         )
 
-        # Show mapping from symbols in the file to root codes & weights
-        st.subheader("Instrument root codes & mini-equivalent weights used")
+        # Show mapping from root codes & symbols to weights under the selected ratio
+        st.subheader("Instrument root codes & mini-equivalent weights (under selected ratio)")
         unique_assets = sorted(cleaned_df["asset"].astype(str).str.upper().unique())
         mapping_rows = []
         seen_roots = set()
         for sym in unique_assets:
             root = get_root_code(sym)
-            weight = get_instrument_weight(sym)
+            weight = get_instrument_weight(sym, micro_weight_global)
             if root not in seen_roots:
                 seen_roots.add(root)
                 mapping_rows.append(
                     {
                         "Root Code": root,
                         "Example Symbol": sym,
+                        "Type": ROOT_TYPES.get(root, "mini (default)"),
                         "Mini-Equiv Weight (per 1 contract)": weight,
                     }
                 )
@@ -300,7 +301,8 @@ if uploaded_file is not None:
         if not intervals_summary:
             st.info(
                 f"No time intervals found where overlapping positions in different "
-                f"root Codes exceeded {max_mini_equiv} mini-equivalents."
+                f"root Codes exceeded {max_mini_equiv} mini-equivalents under a "
+                f"{ratio_option} Mini:Micro ratio."
             )
         else:
             summary_df = pd.DataFrame(intervals_summary)
@@ -308,15 +310,15 @@ if uploaded_file is not None:
 
             st.success(
                 f"Found {len(summary_df)} interval(s) where overlapping positions "
-                f"in different instruments exceeded {max_mini_equiv} mini-equivalents."
+                f"in different instruments exceeded {max_mini_equiv} mini-equivalents "
+                f"under a {ratio_option} Mini:Micro ratio."
             )
 
             st.subheader("Detailed per-symbol overlapping exposure (color-coded)")
 
             detail_df = pd.DataFrame(detail_rows)
 
-            # Assign a color to each Group ID so rows from the same overlapping
-            # interval share the same background.
+            # Color rows by Group ID so overlapping trades are visually linked
             color_cycle = [
                 "#ffcccc",
                 "#ccffcc",
@@ -349,7 +351,8 @@ if uploaded_file is not None:
                 "Each color represents one interval where total mini-equivalent "
                 "exposure across multiple instruments exceeded the max. "
                 "Rows with the same color belong to the same overlapping interval, "
-                "showing both reconstructed trades independently but grouped by root Code."
+                "showing both reconstructed trades independently, using the selected "
+                f"{ratio_option} Mini:Micro ratio."
             )
 
     except Exception as e:

@@ -9,8 +9,8 @@ st.write(
 
     1. Choose the **Mini:Micro contract ratio** for this account (1:1, 1:5, 1:10).
     2. Enter the **max allowed simultaneous exposure in mini-equivalents**.
-    3. Optionally set a **minimum overexposure duration in seconds** to ignore
-       very short spikes.
+    3. Set a **minimum overexposure duration (seconds)** for the
+       "Overexposure ≥ Xs" view.
 
     The app will:
 
@@ -19,18 +19,21 @@ st.write(
     - Apply mini-equivalent weights:
         - Minis (and MBT/MET): 1.0 mini-equivalent per contract.
         - Micros: (1 / chosen ratio) mini-equivalent per contract.
-    - Reconstruct positions over time from fills.
-    - Detect intervals where:
-        - Total mini-equivalent exposure exceeds the max, and
-        - The overexposure lasts at least the chosen number of seconds.
-    - Cross-link those intervals to **trades** (from the trades export) by
-      time overlap.
-    - Use the **Net PnL** from the trades export to summarize:
-        - Total Net PnL for all trades.
-        - Net PnL from trades that were involved in overexposure.
-    - In the trades detail:
-        - Show **Bias** (LONG / SHORT).
-        - Indicate whether each trade is **Mini or Micro**.
+    - Reconstruct positions over time from fills and detect intervals where
+      **total mini-equivalent exposure exceeds the max**.
+    - Compute:
+        - All overexposed intervals (no duration filter).
+        - Overexposed intervals lasting **≥ X seconds**.
+    - Cross-link those intervals to **trades** by time overlap.
+    - Use **Net PnL** from the trades export to summarize:
+        - Total Net PnL (all trades)
+        - Net PnL from all overexposure
+        - Net PnL from overexposure ≥ X seconds
+        - Overexposure ≥ Xs as % of total Net PnL
+    - For each overexposed interval (≥ Xs), show:
+        - Exposure snapshot (per symbol)
+        - Overlapping trades with **Bias** and **Mini/Micro** classification.
+    - At the end, prepare a **top-3 overexposure narrative copy** ready to paste.
     """
 )
 
@@ -62,7 +65,7 @@ max_mini_equiv = st.number_input(
 )
 
 min_duration_seconds = st.number_input(
-    "Minimum overexposure duration (seconds)",
+    "Minimum overexposure duration for 'Overexposure ≥ Xs' (seconds)",
     min_value=0,
     value=0,
     step=1,
@@ -105,10 +108,7 @@ KNOWN_ROOTS = sorted(ROOT_TYPES.keys(), key=len, reverse=True)
 
 
 def get_root_code(asset: str) -> str:
-    """
-    Given a symbol (e.g. 'MNQZ5', 'ESM4'),
-    return the ROOT Code (e.g. 'MNQ', 'ES') by prefix match.
-    """
+    """Return the ROOT Code (e.g. 'MNQ', 'ES') by prefix match."""
     code = str(asset).strip().upper()
     for root in KNOWN_ROOTS:
         if code.startswith(root):
@@ -135,13 +135,14 @@ def get_instrument_weight(asset: str, micro_weight: float) -> float:
         return 1.0
 
 
-def find_overexposure_with_details(
+def detect_overexposure_intervals(
     df: pd.DataFrame,
     max_mini_equiv: float,
     micro_weight: float,
-    min_duration_seconds: int,
 ):
     """
+    Detect ALL overexposed intervals (without duration filtering).
+
     From a fills DataFrame with columns:
         - action (Buy/Sell)
         - asset  (symbol, e.g. MNQZ5, NQZ5, SILH4, etc.)
@@ -149,8 +150,8 @@ def find_overexposure_with_details(
         - timestamp
 
     Returns:
-        intervals_summary: list of dicts (one row per overexposed interval)
-        detail_rows: list of dicts (one row per symbol per overexposed interval)
+        intervals: list of dicts (one row per overexposed interval)
+        detail_rows: list of dicts (one row per symbol per interval)
         cleaned_df: cleaned & time-ordered fills used in the computation
     """
     required_cols = {"action", "asset", "quantity", "timestamp"}
@@ -169,7 +170,7 @@ def find_overexposure_with_details(
         return [], [], df
 
     positions = {}  # asset (full symbol) -> net position (signed)
-    intervals_summary = []
+    intervals = []
     detail_rows = []
     group_id = 0
 
@@ -203,50 +204,48 @@ def find_overexposure_with_details(
             if snapshot:
                 total_exposure = sum(info["exposure"] for info in snapshot.values())
 
-                # Duration filter: skip if interval is shorter than requested
-                if duration >= min_duration_seconds:
-                    # Overexposure condition: total exposure > max
-                    if total_exposure > max_mini_equiv:
-                        group_id += 1
+                # Overexposure condition: total exposure > max
+                if total_exposure > max_mini_equiv:
+                    group_id += 1
 
-                        # Aggregate exposure by root for the summary
-                        root_exposure = {}
-                        for info in snapshot.values():
-                            r = info["root"]
-                            root_exposure[r] = root_exposure.get(r, 0.0) + info["exposure"]
+                    # Aggregate exposure by root for the summary
+                    root_exposure = {}
+                    for info in snapshot.values():
+                        r = info["root"]
+                        root_exposure[r] = root_exposure.get(r, 0.0) + info["exposure"]
 
-                        intervals_summary.append(
+                    intervals.append(
+                        {
+                            "Group ID": group_id,
+                            "Interval Start": start,
+                            "Interval End": end,
+                            "Duration_sec": duration,
+                            "Total Mini-Equiv Exposure": total_exposure,
+                            "Exposure by Root (mini-equiv)": ", ".join(
+                                f"{r}: {root_exposure[r]:.2f}"
+                                for r in sorted(root_exposure)
+                            ),
+                        }
+                    )
+
+                    # Detailed rows (one per symbol per interval)
+                    for asset, info in snapshot.items():
+                        detail_rows.append(
                             {
                                 "Group ID": group_id,
                                 "Interval Start": start,
                                 "Interval End": end,
-                                "Duration (sec)": duration,
-                                "Total Mini-Equiv Exposure": total_exposure,
-                                "Exposure by Root (mini-equiv)": ", ".join(
-                                    f"{r}: {root_exposure[r]:.2f}"
-                                    for r in sorted(root_exposure)
-                                ),
+                                "Duration_sec": duration,
+                                "Symbol": asset,
+                                "Root Code": info["root"],
+                                "Position Contracts": info["contracts"],
+                                "Mini-Equiv Weight": info["weight"],
+                                "Mini-Equiv Exposure": info["exposure"],
                             }
                         )
 
-                        # Detailed rows (one per symbol per interval)
-                        for asset, info in snapshot.items():
-                            detail_rows.append(
-                                {
-                                    "Group ID": group_id,
-                                    "Interval Start": start,
-                                    "Interval End": end,
-                                    "Duration (sec)": duration,
-                                    "Symbol": asset,
-                                    "Root Code": info["root"],
-                                    "Position Contracts": info["contracts"],
-                                    "Mini-Equiv Weight": info["weight"],
-                                    "Mini-Equiv Exposure": info["exposure"],
-                                }
-                            )
-
         # Apply current fill to update positions
-        qty = row["quantity"]
+        qty = df.loc[i, "quantity"]
         action = str(row["action"]).strip().lower()
         asset = row["asset"]
 
@@ -260,13 +259,11 @@ def find_overexposure_with_details(
 
         positions[asset] = positions.get(asset, 0.0) + delta
 
-    return intervals_summary, detail_rows, df
+    return intervals, detail_rows, df
 
 
 def parse_money_to_float(series: pd.Series) -> pd.Series:
-    """
-    Convert a Series of money strings like '$190.50' to floats 190.50.
-    """
+    """Convert a Series of money strings like '$190.50' to floats 190.50."""
     return pd.to_numeric(series.astype(str).str.replace("[$,]", "", regex=True), errors="coerce")
 
 
@@ -297,42 +294,42 @@ def infer_bias_column(df: pd.DataFrame) -> pd.Series:
         return pd.Series(["UNKNOWN"] * len(df), index=df.index)
 
 
+def get_account_id(trades_df: pd.DataFrame) -> str:
+    """
+    Try to infer an account identifier from the trades CSV.
+    Looks for any column containing 'account' in its name.
+    """
+    account_id = "XXXXX"
+    for col in trades_df.columns:
+        if "account" in col.lower():
+            val = trades_df[col].dropna().astype(str)
+            if not val.empty:
+                account_id = val.iloc[0]
+                break
+    return account_id
+
+
 if fills_file is not None and trades_file is not None:
     try:
         fills_df = pd.read_csv(fills_file)
         trades_df = pd.read_csv(trades_file)
 
-        st.subheader("Raw fills (first 50 rows)")
-        st.dataframe(fills_df.head(50))
-
-        st.subheader("Raw trades (first 50 rows)")
-        st.dataframe(trades_df.head(50))
-
         # --- Overexposure detection from fills --------------------------------
-        intervals_summary, detail_rows, cleaned_fills = find_overexposure_with_details(
+        intervals_all, detail_all, cleaned_fills = detect_overexposure_intervals(
             fills_df,
             max_mini_equiv=max_mini_equiv,
             micro_weight=micro_weight_global,
-            min_duration_seconds=min_duration_seconds,
-        )
-
-        st.subheader("Cleaned & time-ordered fills used for calculation")
-        fills_cols_to_show = [
-            c for c in ["timestamp_dt", "timestamp", "action", "asset", "quantity", "price"]
-            if c in cleaned_fills.columns
-        ]
-        st.dataframe(
-            cleaned_fills[fills_cols_to_show].head(200),
-            use_container_width=True,
         )
 
         # --- Trades preprocessing ---------------------------------------------
         trades_df = trades_df.copy()
         trades_df["Open_dt"] = pd.to_datetime(trades_df["Open Time"], errors="coerce")
         trades_df["Close_dt"] = pd.to_datetime(trades_df["Close Time"], errors="coerce")
-        trades_df["Duration_sec"] = (trades_df["Close_dt"] - trades_df["Open_dt"]).dt.total_seconds()
+        trades_df["Duration_sec"] = (
+            trades_df["Close_dt"] - trades_df["Open_dt"]
+        ).dt.total_seconds()
 
-        # Net PnL
+        # Net PnL (Net Profit)
         if "Net Profit" in trades_df.columns:
             trades_df["NetProfit_val"] = parse_money_to_float(trades_df["Net Profit"])
         else:
@@ -347,32 +344,49 @@ if fills_file is not None and trades_file is not None:
         # Bias (LONG / SHORT / UNKNOWN)
         trades_df["Bias"] = infer_bias_column(trades_df)
 
-        # --- Instrument mapping summary (from fills) --------------------------
-        st.subheader("Instrument root codes & mini-equivalent weights (under selected ratio)")
-        unique_assets = sorted(cleaned_fills["asset"].astype(str).str.upper().unique())
-        mapping_rows = []
-        seen_roots = set()
-        for sym in unique_assets:
-            root = get_root_code(sym)
-            weight = get_instrument_weight(sym, micro_weight_global)
-            if root not in seen_roots:
-                seen_roots.add(root)
-                mapping_rows.append(
-                    {
-                        "Root Code": root,
-                        "Example Symbol (from fills)": sym,
-                        "Type": ROOT_TYPES.get(root, "mini (default)"),
-                        "Mini-Equiv Weight (per 1 contract)": weight,
-                    }
-                )
-        if mapping_rows:
-            mapping_df = pd.DataFrame(mapping_rows).sort_values("Root Code")
-            st.dataframe(mapping_df, use_container_width=True)
+        # --- Partition intervals by duration threshold ------------------------
+        intervals_df_all = pd.DataFrame(intervals_all)
+        detail_df_all = pd.DataFrame(detail_all)
 
-        # --- Overexposed intervals -------------------------------------------
-        st.subheader("Overexposed intervals summary")
+        if not intervals_df_all.empty:
+            if min_duration_seconds > 0:
+                intervals_df_filtered = intervals_df_all[
+                    intervals_df_all["Duration_sec"] >= min_duration_seconds
+                ].copy()
+            else:
+                intervals_df_filtered = intervals_df_all.copy()
+        else:
+            intervals_df_filtered = pd.DataFrame(columns=["Group ID"])
 
-        if not intervals_summary:
+        filtered_group_ids = set(intervals_df_filtered["Group ID"].unique())
+        detail_df_filtered = (
+            detail_df_all[detail_df_all["Group ID"].isin(filtered_group_ids)].copy()
+            if not detail_df_all.empty
+            else pd.DataFrame(columns=["Group ID"])
+        )
+
+        # --- Compute trade index sets for PnL aggregation ----------------------
+        overexposed_trade_indices_all = set()
+        overexposed_trade_indices_filtered = set()
+
+        # All overexposed intervals (no duration filter)
+        for _, inter_row in intervals_df_all.iterrows():
+            start_all = inter_row["Interval Start"]
+            end_all = inter_row["Interval End"]
+            mask_all = (trades_df["Open_dt"] < end_all) & (trades_df["Close_dt"] > start_all)
+            overexposed_trade_indices_all.update(trades_df[mask_all].index.tolist())
+
+        # Filtered intervals (>= duration threshold)
+        for _, inter_row in intervals_df_filtered.iterrows():
+            start_f = inter_row["Interval Start"]
+            end_f = inter_row["Interval End"]
+            mask_f = (trades_df["Open_dt"] < end_f) & (trades_df["Close_dt"] > start_f)
+            overexposed_trade_indices_filtered.update(trades_df[mask_f].index.tolist())
+
+        # --- Overexposed intervals with matching trades (only filtered ones) ---
+        st.subheader("Overexposed intervals with matching trades")
+
+        if intervals_df_filtered.empty:
             if min_duration_seconds > 0:
                 st.info(
                     f"No intervals found where total exposure exceeded {max_mini_equiv} "
@@ -384,85 +398,29 @@ if fills_file is not None and trades_file is not None:
                     f"No intervals found where total exposure exceeded {max_mini_equiv} "
                     f"mini-equivalents under a {ratio_option} Mini:Micro ratio."
                 )
-            overexposed_trade_indices = set()
         else:
-            summary_df = pd.DataFrame(intervals_summary)
-            st.dataframe(summary_df, use_container_width=True)
-
-            st.success(
-                f"Found {len(summary_df)} interval(s) where total exposure exceeded "
-                f"{max_mini_equiv} mini-equivalents under a {ratio_option} Mini:Micro ratio"
-                + (f" and lasted at least {min_duration_seconds} seconds." if min_duration_seconds > 0 else ".")
-            )
-
-            detail_df = pd.DataFrame(detail_rows)
-
-            # Color rows by Group ID so overexposed intervals are visually linked
-            color_cycle = [
-                "#ffcccc",
-                "#ccffcc",
-                "#ccccff",
-                "#fff2cc",
-                "#f4cccc",
-                "#d9d2e9",
-                "#cfe2f3",
-                "#d0e0e3",
-            ]
-            unique_groups = sorted(detail_df["Group ID"].unique())
-            group_to_color = {
-                gid: color_cycle[idx % len(color_cycle)]
-                for idx, gid in enumerate(unique_groups)
-            }
-            detail_df["Color"] = detail_df["Group ID"].map(group_to_color)
-
-            def color_rows(row):
-                color = row["Color"]
-                return [
-                    f"background-color: {color}" if col != "Color" else ""
-                    for col in row.index
-                ]
-
-            styled_detail = detail_df.style.apply(color_rows, axis=1)
-
-            st.subheader("Detailed per-symbol overexposure (color-coded)")
-            st.dataframe(styled_detail, use_container_width=True)
-
-            st.caption(
-                "Each color represents an interval where total mini-equivalent exposure "
-                "was above your limit. Rows with the same color belong to the same "
-                "overexposure interval, showing each symbol's reconstructed position "
-                f"under the selected {ratio_option} Mini:Micro ratio."
-            )
-
-            # --- Cross-link overexposed intervals to trades -------------------
-            overexposed_trade_indices = set()
-            intervals_df = pd.DataFrame(intervals_summary)
-
-            st.subheader("Overexposed intervals with matching trades")
-
-            for gid in sorted(intervals_df["Group ID"].unique()):
-                inter_row = intervals_df[intervals_df["Group ID"] == gid].iloc[0]
+            for gid in sorted(intervals_df_filtered["Group ID"].unique()):
+                inter_row = intervals_df_filtered[intervals_df_filtered["Group ID"] == gid].iloc[0]
                 start = inter_row["Interval Start"]
                 end = inter_row["Interval End"]
 
-                # Trades whose lifespan overlaps this interval
+                # Trades whose lifespan overlaps this interval (already duration-filtered set)
                 mask = (trades_df["Open_dt"] < end) & (trades_df["Close_dt"] > start)
                 trades_for_interval = trades_df[mask].copy()
-                overexposed_trade_indices.update(trades_for_interval.index.tolist())
 
                 with st.expander(
                     f"Interval {gid}: {start} → {end} "
-                    f"(Exposure: {inter_row['Total Mini-Equiv Exposure']:.2f})"
+                    f"(Exposure: {inter_row['Total Mini-Equiv Exposure']:.2f}, "
+                    f"Duration: {inter_row['Duration_sec']:.2f}s)"
                 ):
                     st.markdown("**Exposure snapshot (per symbol)**")
-                    exp_rows = detail_df[detail_df["Group ID"] == gid].copy()
+                    exp_rows = detail_df_filtered[detail_df_filtered["Group ID"] == gid].copy()
                     exp_cols = [
                         "Symbol",
                         "Root Code",
                         "Position Contracts",
                         "Mini-Equiv Weight",
                         "Mini-Equiv Exposure",
-                        "Duration (sec)",
                     ]
                     st.dataframe(exp_rows[exp_cols], use_container_width=True)
 
@@ -470,7 +428,6 @@ if fills_file is not None and trades_file is not None:
                     if trades_for_interval.empty:
                         st.info("No trades from the trades export overlap this interval.")
                     else:
-                        # Prepare trade detail: Bias, Size Type, Net PnL, etc.
                         trade_cols = [
                             "Symbol",
                             "Root Code",
@@ -482,7 +439,7 @@ if fills_file is not None and trades_file is not None:
                             "Duration_sec",
                             "Net Profit",
                             "NetProfit_val",
-                            "Open_dt",  # keep for sorting
+                            "Open_dt",  # used for sorting
                         ]
                         existing_trade_cols = [c for c in trade_cols if c in trades_for_interval.columns]
 
@@ -496,75 +453,186 @@ if fills_file is not None and trades_file is not None:
                             "**Mini or Micro** (Size Type), based on the root Code."
                         )
 
-        # --- Net PnL summary from trades -------------------------------------
+        # --- Net PnL summary from trades --------------------------------------
         st.subheader("Net PnL Summary (from trades export)")
+
+        total_net_pnl = None
+        pnl_overexposure_all = None
+        pnl_overexposure_filtered = None
+        perc_overexposure = None
 
         if "NetProfit_val" in trades_df.columns and trades_df["NetProfit_val"].notna().any():
             total_net_pnl = trades_df["NetProfit_val"].sum()
 
-            pnl_overexposed_trades = trades_df.loc[
-                list(overexposed_trade_indices), "NetProfit_val"
-            ].sum() if overexposed_trade_indices else 0.0
+            # PnL from trades involved in ANY overexposure interval (ignoring duration threshold)
+            pnl_overexposure_all = (
+                trades_df.loc[list(overexposed_trade_indices_all), "NetProfit_val"].sum()
+                if overexposed_trade_indices_all
+                else 0.0
+            )
 
-            col1, col2 = st.columns(2)
+            # PnL from trades involved in overexposure intervals that meet duration threshold
+            pnl_overexposure_filtered = (
+                trades_df.loc[list(overexposed_trade_indices_filtered), "NetProfit_val"].sum()
+                if overexposed_trade_indices_filtered
+                else 0.0
+            )
+
+            # Overexposure as % of total (based on duration-filtered PnL)
+            if total_net_pnl != 0:
+                perc_overexposure = 100.0 * (pnl_overexposure_filtered / total_net_pnl)
+            else:
+                perc_overexposure = 0.0
+
+            col1, col2, col3, col4 = st.columns(4)
             col1.metric(
                 "Total Net PnL (all trades)",
                 f"{total_net_pnl:,.2f}",
                 help="Sum of Net Profit from the trades export.",
             )
             col2.metric(
-                "Net PnL from overexposed trades",
-                f"{pnl_overexposed_trades:,.2f}",
+                "Net PnL from all overexposure",
+                f"{pnl_overexposure_all:,.2f}",
                 help=(
                     "Sum of Net Profit from trades that overlapped at least one "
-                    "overexposure interval under the current settings."
+                    "overexposed interval (regardless of duration)."
                 ),
             )
-
-            # Detailed Net PnL per trade, flagging overexposed ones
-            st.subheader("Trades detail with Net PnL and overexposure flag")
-
-            trades_df["Involved in Overexposure"] = trades_df.index.isin(
-                overexposed_trade_indices
+            col3.metric(
+                f"Net PnL from overexposure ≥ {min_duration_seconds}s",
+                f"{pnl_overexposure_filtered:,.2f}",
+                help=(
+                    "Sum of Net Profit from trades that overlapped at least one "
+                    f"overexposed interval lasting ≥ {min_duration_seconds} seconds."
+                ),
             )
-            trades_detail_cols = [
-                "Symbol",
-                "Root Code",
-                "Size Type",
-                "Bias",
-                "Volume",
-                "Open Time",
-                "Close Time",
-                "Duration_sec",
-                "Net Profit",
-                "NetProfit_val",
-                "Involved in Overexposure",
-                "Open_dt",
-            ]
-            existing_cols = [c for c in trades_detail_cols if c in trades_df.columns]
-            trades_detail_df = trades_df[existing_cols].copy()
-
-            trades_detail_df = trades_detail_df.sort_values(
-                ["Involved in Overexposure", "Open_dt"],
-                ascending=[False, True],
-            )
-
-            st.dataframe(
-                trades_detail_df,
-                use_container_width=True,
-            )
-
-            st.caption(
-                "Net PnL is taken directly from the trades export (**Net Profit**). "
-                "Trades flagged as 'Involved in Overexposure' are those whose "
-                "lifespan overlapped at least one overexposed interval. "
-                "Each trade shows its **Bias** and whether it is **Mini or Micro**."
+            col4.metric(
+                f"Overexposure ≥ {min_duration_seconds}s as % of total PnL",
+                f"{perc_overexposure:,.2f}%",
+                help=(
+                    "Net PnL from overexposure intervals (≥ duration threshold) "
+                    "as a percentage of total Net PnL."
+                ),
             )
         else:
             st.warning(
                 "No valid 'Net Profit' column found in the trades CSV, so Net PnL "
                 "could not be computed. Make sure your trades export includes "
                 "a 'Net Profit' column."
+            )
+
+        # --- Prepared copy for top-3 overexposures ----------------------------
+        st.subheader("Prepared overexposure summary copy")
+
+        if intervals_df_all.empty:
+            st.info("No overexposure intervals detected; no copy can be prepared.")
+        else:
+            # Choose intervals for the copy:
+            # Prefer duration-filtered set; if empty, fall back to all
+            if not intervals_df_filtered.empty:
+                base_df = intervals_df_filtered.copy()
+            else:
+                base_df = intervals_df_all.copy()
+
+            # Sort by total exposure (largest first) and take top 3
+            base_df = base_df.sort_values(
+                "Total Mini-Equiv Exposure", ascending=False
+            ).head(3)
+
+            # Account ID & reference date
+            account_id = get_account_id(trades_df)
+            first_date = base_df.iloc[0]["Interval Start"].date()
+            ref_date_str = first_date.strftime("%B %d, %Y")  # e.g. December 17, 2025
+
+            # Prepare narrative copy
+            copy_lines = []
+
+            copy_lines.append(
+                f"As detailed below from your trading history for your Sim Funded account {account_id} on {ref_date_str},"
+            )
+            copy_lines.append("")
+
+            # Helper: format time ranges
+            def fmt_interval_time(dt):
+                # Example: 06:56:37 AM ET
+                return dt.strftime("%I:%M:%S %p ET").lstrip("0")
+
+            def fmt_trade_time(dt):
+                # Example: Dec 17, 03:32:17 AM EST
+                return dt.strftime("%b %d, %I:%M:%S %p EST")
+
+            # For each selected overexposure instance
+            for idx, (_, inter_row) in enumerate(base_df.iterrows()):
+                start = inter_row["Interval Start"]
+                end = inter_row["Interval End"]
+                start_str = fmt_interval_time(start)
+                end_str = fmt_interval_time(end)
+
+                if idx == 0:
+                    copy_lines.append(
+                        f"Between {start_str} and {end_str}, your account held the following positions simultaneously:"
+                    )
+                else:
+                    copy_lines.append("")
+                    copy_lines.append(
+                        f"In another instance, between {start_str} and {end_str}, your account again held positions simultaneously exceeding the maximum allowed contract exposure:"
+                    )
+
+                copy_lines.append("")
+
+                # Trades overlapping this interval
+                mask = (trades_df["Open_dt"] < end) & (trades_df["Close_dt"] > start)
+                trades_for_interval = trades_df[mask].copy()
+
+                if trades_for_interval.empty:
+                    copy_lines.append("(No matching trades found in the trades export.)")
+                    copy_lines.append("")
+                else:
+                    # For each trade, list contracts & open/close times
+                    trades_for_interval = trades_for_interval.sort_values("Open_dt")
+                    for _, trow in trades_for_interval.iterrows():
+                        symbol = trow.get("Symbol", "")
+                        size_type = trow.get("Size Type", "Mini")
+                        size_word = "Mini" if str(size_type).lower().startswith("mini") else "Micro"
+
+                        volume = trow.get("Volume", "")
+                        try:
+                            if pd.isna(volume):
+                                volume_str = "X"
+                            else:
+                                volume_str = str(int(float(volume)))
+                        except Exception:
+                            volume_str = str(volume) if volume not in ("", None) else "X"
+
+                        copy_lines.append(f"{volume_str} {size_word} contracts – {symbol}")
+                        open_dt = trow.get("Open_dt")
+                        close_dt = trow.get("Close_dt")
+
+                        if pd.notna(open_dt):
+                            copy_lines.append(f"")
+                            copy_lines.append(f"Opened: {fmt_trade_time(open_dt)}")
+                        if pd.notna(close_dt):
+                            copy_lines.append(f"Closed: {fmt_trade_time(close_dt)}")
+                        copy_lines.append("")
+
+            # Concluding lines
+            # Use max_mini_equiv as the limit in the narrative
+            limit_val = int(max_mini_equiv) if max_mini_equiv.is_integer() else max_mini_equiv
+            copy_lines.append(
+                f"This exceeds the maximum allowed limit of {limit_val} contracts under the Cross-Instrument Policy based on your account plan limit."
+            )
+            copy_lines.append("")
+            num_occ = int(intervals_df_all["Group ID"].nunique())
+            copy_lines.append(
+                f"Please note your account has been found to exceed the max allowed contracts on more than {num_occ} different occasions."
+            )
+
+            final_copy = "\n".join(copy_lines)
+
+            st.text_area(
+                "Copy (ready to paste):",
+                value=final_copy,
+                height=400,
             )
 
     except Exception as e:

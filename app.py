@@ -9,20 +9,21 @@ st.write(
 
     1. Choose the **Mini:Micro contract ratio** for this account (1:1, 1:5, 1:10).
     2. Enter the **max allowed simultaneous exposure in mini-equivalents**.
+    3. Optionally set a **minimum overexposure duration in seconds** to ignore
+       very short spikes.
 
     The app:
 
     - Uses the **root Code** as per the My Funded Futures instrument list.
     - Classifies each product as **mini** or **micro**.
     - Applies mini-equivalent weights:
-        - Minis: 1.0 mini-equivalent per contract.
+        - Minis (and MBT/MET): 1.0 mini-equivalent per contract.
         - Micros: (1 / chosen ratio) mini-equivalent per contract.
-        - **MBT** and **MET** are treated as minis for risk (weight = 1.0).
     - Reconstructs positions over time from fills.
     - Finds time intervals where:
-        - At least **two different root Codes** have open positions, and
-        - The **total mini-equivalent exposure** exceeds the max.
-    - Shows a summary and a **color-coded detailed table** of both reconstructed trades.
+        - Total mini-equivalent exposure exceeds the max, and
+        - The overexposure lasts at least the chosen number of seconds.
+    - Shows a summary and a **color-coded detailed table** of exposures.
     """
 )
 
@@ -49,6 +50,13 @@ max_mini_equiv = st.number_input(
     min_value=0.0,
     value=5.0,
     step=0.5,
+)
+
+min_duration_seconds = st.number_input(
+    "Minimum overexposure duration (seconds)",
+    min_value=0,
+    value=0,
+    step=1,
 )
 
 # --------------------------------------------------------------------
@@ -130,10 +138,11 @@ def get_instrument_weight(asset: str, micro_weight: float) -> float:
         return 1.0
 
 
-def find_overlapping_exposure_with_details(
+def find_overexposure_with_details(
     df: pd.DataFrame,
     max_mini_equiv: float,
     micro_weight: float,
+    min_duration_seconds: int,
 ):
     """
     From a fills DataFrame with columns:
@@ -143,8 +152,8 @@ def find_overlapping_exposure_with_details(
         - timestamp
 
     Returns:
-        intervals_summary: list of dicts (one row per violating interval)
-        detail_rows: list of dicts (one row per symbol per violating interval)
+        intervals_summary: list of dicts (one row per overexposed interval)
+        detail_rows: list of dicts (one row per symbol per overexposed interval)
         cleaned_df: cleaned & time-ordered fills used in the computation
     """
     required_cols = {"action", "asset", "quantity", "timestamp"}
@@ -172,6 +181,7 @@ def find_overlapping_exposure_with_details(
         if i > 0:
             start = df.loc[i - 1, "timestamp_dt"]
             end = row["timestamp_dt"]
+            duration = (end - start).total_seconds()
 
             # Snapshot mini-equivalent exposure per symbol at this interval
             snapshot = {}  # asset -> info dict
@@ -195,47 +205,50 @@ def find_overlapping_exposure_with_details(
 
             if snapshot:
                 total_exposure = sum(info["exposure"] for info in snapshot.values())
-                active_roots = {info["root"] for info in snapshot.values()}
 
-                # Condition:
-                #   - at least two different root Codes live (different instruments)
-                #   - total exposure > max_mini_equiv
-                if len(active_roots) >= 2 and total_exposure > max_mini_equiv:
-                    group_id += 1
+                # Duration filter: skip if interval is shorter than requested
+                if duration < min_duration_seconds:
+                    pass
+                else:
+                    # Overexposure condition: total exposure > max
+                    if total_exposure > max_mini_equiv:
+                        group_id += 1
 
-                    # Aggregate exposure by root for the summary
-                    root_exposure = {}
-                    for info in snapshot.values():
-                        r = info["root"]
-                        root_exposure[r] = root_exposure.get(r, 0.0) + info["exposure"]
+                        # Aggregate exposure by root for the summary
+                        root_exposure = {}
+                        for info in snapshot.values():
+                            r = info["root"]
+                            root_exposure[r] = root_exposure.get(r, 0.0) + info["exposure"]
 
-                    intervals_summary.append(
-                        {
-                            "Group ID": group_id,
-                            "Interval Start": start,
-                            "Interval End": end,
-                            "Total Mini-Equiv Exposure": total_exposure,
-                            "Active Roots (mini-equiv)": ", ".join(
-                                f"{r}: {root_exposure[r]:.2f}"
-                                for r in sorted(root_exposure)
-                            ),
-                        }
-                    )
-
-                    # Detailed rows (one per symbol per interval)
-                    for asset, info in snapshot.items():
-                        detail_rows.append(
+                        intervals_summary.append(
                             {
                                 "Group ID": group_id,
                                 "Interval Start": start,
                                 "Interval End": end,
-                                "Symbol": asset,
-                                "Root Code": info["root"],
-                                "Position Contracts": info["contracts"],
-                                "Mini-Equiv Weight": info["weight"],
-                                "Mini-Equiv Exposure": info["exposure"],
+                                "Duration (sec)": duration,
+                                "Total Mini-Equiv Exposure": total_exposure,
+                                "Exposure by Root (mini-equiv)": ", ".join(
+                                    f"{r}: {root_exposure[r]:.2f}"
+                                    for r in sorted(root_exposure)
+                                ),
                             }
                         )
+
+                        # Detailed rows (one per symbol per interval)
+                        for asset, info in snapshot.items():
+                            detail_rows.append(
+                                {
+                                    "Group ID": group_id,
+                                    "Interval Start": start,
+                                    "Interval End": end,
+                                    "Duration (sec)": duration,
+                                    "Symbol": asset,
+                                    "Root Code": info["root"],
+                                    "Position Contracts": info["contracts"],
+                                    "Mini-Equiv Weight": info["weight"],
+                                    "Mini-Equiv Exposure": info["exposure"],
+                                }
+                            )
 
         # Apply current fill to update positions
         qty = row["quantity"]
@@ -262,10 +275,11 @@ if uploaded_file is not None:
         st.subheader("Raw fills (first 50 rows)")
         st.dataframe(fills_df.head(50))
 
-        intervals_summary, detail_rows, cleaned_df = find_overlapping_exposure_with_details(
+        intervals_summary, detail_rows, cleaned_df = find_overexposure_with_details(
             fills_df,
             max_mini_equiv=max_mini_equiv,
             micro_weight=micro_weight_global,
+            min_duration_seconds=min_duration_seconds,
         )
 
         st.subheader("Cleaned & time-ordered fills used for calculation")
@@ -296,29 +310,35 @@ if uploaded_file is not None:
             mapping_df = pd.DataFrame(mapping_rows).sort_values("Root Code")
             st.dataframe(mapping_df, use_container_width=True)
 
-        st.subheader("Overlapping intervals summary")
+        st.subheader("Overexposed intervals summary")
 
         if not intervals_summary:
-            st.info(
-                f"No time intervals found where overlapping positions in different "
-                f"root Codes exceeded {max_mini_equiv} mini-equivalents under a "
-                f"{ratio_option} Mini:Micro ratio."
-            )
+            if min_duration_seconds > 0:
+                st.info(
+                    f"No intervals found where total exposure exceeded {max_mini_equiv} "
+                    f"mini-equivalents for at least {min_duration_seconds} seconds "
+                    f"under a {ratio_option} Mini:Micro ratio."
+                )
+            else:
+                st.info(
+                    f"No intervals found where total exposure exceeded {max_mini_equiv} "
+                    f"mini-equivalents under a {ratio_option} Mini:Micro ratio."
+                )
         else:
             summary_df = pd.DataFrame(intervals_summary)
             st.dataframe(summary_df, use_container_width=True)
 
             st.success(
-                f"Found {len(summary_df)} interval(s) where overlapping positions "
-                f"in different instruments exceeded {max_mini_equiv} mini-equivalents "
-                f"under a {ratio_option} Mini:Micro ratio."
+                f"Found {len(summary_df)} interval(s) where total exposure exceeded "
+                f"{max_mini_equiv} mini-equivalents under a {ratio_option} Mini:Micro ratio"
+                + (f" and lasted at least {min_duration_seconds} seconds." if min_duration_seconds > 0 else ".")
             )
 
-            st.subheader("Detailed per-symbol overlapping exposure (color-coded)")
+            st.subheader("Detailed per-symbol overexposure (color-coded)")
 
             detail_df = pd.DataFrame(detail_rows)
 
-            # Color rows by Group ID so overlapping trades are visually linked
+            # Color rows by Group ID so overexposed intervals are visually linked
             color_cycle = [
                 "#ffcccc",
                 "#ccffcc",
@@ -348,11 +368,10 @@ if uploaded_file is not None:
             st.dataframe(styled_detail, use_container_width=True)
 
             st.caption(
-                "Each color represents one interval where total mini-equivalent "
-                "exposure across multiple instruments exceeded the max. "
-                "Rows with the same color belong to the same overlapping interval, "
-                "showing both reconstructed trades independently, using the selected "
-                f"{ratio_option} Mini:Micro ratio."
+                "Each color represents an interval where total mini-equivalent exposure "
+                "was above your limit. Rows with the same color belong to the same "
+                "overexposure interval, showing each symbol's reconstructed position "
+                f"under the selected {ratio_option} Mini:Micro ratio."
             )
 
     except Exception as e:

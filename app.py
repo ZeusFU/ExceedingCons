@@ -1,35 +1,44 @@
 import streamlit as st
 import pandas as pd
 
-st.title("Overlapping Exposure Checker (Mini-Equivalent, Root Code Aware)")
+st.title("Overexposure & Net PnL Analyzer (Fills + Trades)")
 
 st.write(
     """
-    Upload a **fills CSV** (like `fills_export.csv`), then:
+    Upload **both** a fills CSV and a trades CSV (like Tradovate exports), then:
 
     1. Choose the **Mini:Micro contract ratio** for this account (1:1, 1:5, 1:10).
     2. Enter the **max allowed simultaneous exposure in mini-equivalents**.
     3. Optionally set a **minimum overexposure duration in seconds** to ignore
        very short spikes.
 
-    The app:
+    The app will:
 
-    - Uses the **root Code** as per the My Funded Futures instrument list.
-    - Classifies each product as **mini** or **micro**.
-    - Applies mini-equivalent weights:
+    - Use the **root Code** (e.g. NQ/MNQ, ES/MES, MGC, SIL, MBT, MET).
+    - Classify each product as **mini** or **micro** (MBT & MET treated as minis).
+    - Apply mini-equivalent weights:
         - Minis (and MBT/MET): 1.0 mini-equivalent per contract.
         - Micros: (1 / chosen ratio) mini-equivalent per contract.
-    - Reconstructs positions over time from fills.
-    - Finds time intervals where:
+    - Reconstruct positions over time from fills.
+    - Detect intervals where:
         - Total mini-equivalent exposure exceeds the max, and
         - The overexposure lasts at least the chosen number of seconds.
-    - Shows a summary and a **color-coded detailed table** of exposures.
+    - Cross-link those intervals to **trades** (from the trades export) by
+      time overlap.
+    - Use the **Net PnL** from the trades export to summarize:
+        - Total Net PnL for all trades.
+        - Net PnL from trades that were involved in overexposure.
+    - In the trades detail:
+        - Show **Bias** (SHORT / LONG).
+        - Indicate whether each trade is **Mini or Micro**.
     """
 )
 
-uploaded_file = st.file_uploader("Upload fills CSV", type=["csv"])
+# --- File uploaders ---------------------------------------------------------
+fills_file = st.file_uploader("Upload fills CSV", type=["csv"], key="fills")
+trades_file = st.file_uploader("Upload trades CSV", type=["csv"], key="trades")
 
-# --- User-selected Mini:Micro ratio -----------------------------------------
+# --- User-selected Mini:Micro ratio ----------------------------------------
 ratio_option = st.selectbox(
     "Mini : Micro contract ratio",
     ["1:1", "1:5", "1:10"],
@@ -104,13 +113,8 @@ KNOWN_ROOTS = sorted(ROOT_TYPES.keys(), key=len, reverse=True)
 
 def get_root_code(asset: str) -> str:
     """
-    Given a symbol from the fills CSV (e.g. 'MNQZ5', 'ESM4'),
-    return the ROOT Code as per the instrument list (e.g. 'MNQ', 'ES').
-
-    Strategy:
-    - Uppercase the asset string.
-    - Find the longest known root that is a prefix.
-    - If none match, fall back to treating the entire symbol as the root.
+    Given a symbol (e.g. 'MNQZ5', 'ESM4'),
+    return the ROOT Code (e.g. 'MNQ', 'ES') by prefix match.
     """
     code = str(asset).strip().upper()
     for root in KNOWN_ROOTS:
@@ -159,7 +163,7 @@ def find_overexposure_with_details(
     required_cols = {"action", "asset", "quantity", "timestamp"}
     missing = required_cols - set(df.columns)
     if missing:
-        raise ValueError(f"CSV is missing required columns: {', '.join(missing)}")
+        raise ValueError(f"Fills CSV is missing required columns: {', '.join(missing)}")
 
     df = df.copy()
     df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce")
@@ -207,9 +211,7 @@ def find_overexposure_with_details(
                 total_exposure = sum(info["exposure"] for info in snapshot.values())
 
                 # Duration filter: skip if interval is shorter than requested
-                if duration < min_duration_seconds:
-                    pass
-                else:
+                if duration >= min_duration_seconds:
                     # Overexposure condition: total exposure > max
                     if total_exposure > max_mini_equiv:
                         group_id += 1
@@ -268,14 +270,26 @@ def find_overexposure_with_details(
     return intervals_summary, detail_rows, df
 
 
-if uploaded_file is not None:
+def parse_money_to_float(series: pd.Series) -> pd.Series:
+    """
+    Convert a Series of money strings like '$190.50' to floats 190.50.
+    """
+    return pd.to_numeric(series.astype(str).str.replace("[$,]", "", regex=True), errors="coerce")
+
+
+if fills_file is not None and trades_file is not None:
     try:
-        fills_df = pd.read_csv(uploaded_file)
+        fills_df = pd.read_csv(fills_file)
+        trades_df = pd.read_csv(trades_file)
 
         st.subheader("Raw fills (first 50 rows)")
         st.dataframe(fills_df.head(50))
 
-        intervals_summary, detail_rows, cleaned_df = find_overexposure_with_details(
+        st.subheader("Raw trades (first 50 rows)")
+        st.dataframe(trades_df.head(50))
+
+        # --- Overexposure detection from fills --------------------------------
+        intervals_summary, detail_rows, cleaned_fills = find_overexposure_with_details(
             fills_df,
             max_mini_equiv=max_mini_equiv,
             micro_weight=micro_weight_global,
@@ -283,14 +297,35 @@ if uploaded_file is not None:
         )
 
         st.subheader("Cleaned & time-ordered fills used for calculation")
+        fills_cols_to_show = [
+            c for c in ["timestamp_dt", "timestamp", "action", "asset", "quantity", "price"]
+            if c in cleaned_fills.columns
+        ]
         st.dataframe(
-            cleaned_df[["timestamp_dt", "action", "asset", "quantity"]].head(200),
+            cleaned_fills[fills_cols_to_show].head(200),
             use_container_width=True,
         )
 
-        # Show mapping from root codes & symbols to weights under the selected ratio
+        # --- Trades preprocessing ---------------------------------------------
+        # Parse datetimes
+        trades_df = trades_df.copy()
+        trades_df["Open_dt"] = pd.to_datetime(trades_df["Open Time"], errors="coerce")
+        trades_df["Close_dt"] = pd.to_datetime(trades_df["Close Time"], errors="coerce")
+        # Parse Net PnL from string like "$190.50"
+        if "Net Profit" in trades_df.columns:
+            trades_df["NetProfit_val"] = parse_money_to_float(trades_df["Net Profit"])
+        else:
+            trades_df["NetProfit_val"] = pd.NA
+
+        # Root & mini/micro classification per trade
+        trades_df["Root Code"] = trades_df["Symbol"].apply(get_root_code)
+        trades_df["Size Type"] = trades_df["Root Code"].apply(
+            lambda r: "Micro" if ROOT_TYPES.get(r, "mini") == "micro" else "Mini"
+        )
+
+        # --- Instrument mapping summary (from fills) --------------------------
         st.subheader("Instrument root codes & mini-equivalent weights (under selected ratio)")
-        unique_assets = sorted(cleaned_df["asset"].astype(str).str.upper().unique())
+        unique_assets = sorted(cleaned_fills["asset"].astype(str).str.upper().unique())
         mapping_rows = []
         seen_roots = set()
         for sym in unique_assets:
@@ -301,7 +336,7 @@ if uploaded_file is not None:
                 mapping_rows.append(
                     {
                         "Root Code": root,
-                        "Example Symbol": sym,
+                        "Example Symbol (from fills)": sym,
                         "Type": ROOT_TYPES.get(root, "mini (default)"),
                         "Mini-Equiv Weight (per 1 contract)": weight,
                     }
@@ -310,6 +345,7 @@ if uploaded_file is not None:
             mapping_df = pd.DataFrame(mapping_rows).sort_values("Root Code")
             st.dataframe(mapping_df, use_container_width=True)
 
+        # --- Overexposed intervals -------------------------------------------
         st.subheader("Overexposed intervals summary")
 
         if not intervals_summary:
@@ -324,6 +360,7 @@ if uploaded_file is not None:
                     f"No intervals found where total exposure exceeded {max_mini_equiv} "
                     f"mini-equivalents under a {ratio_option} Mini:Micro ratio."
                 )
+            overexposed_trade_indices = set()
         else:
             summary_df = pd.DataFrame(intervals_summary)
             st.dataframe(summary_df, use_container_width=True)
@@ -333,8 +370,6 @@ if uploaded_file is not None:
                 f"{max_mini_equiv} mini-equivalents under a {ratio_option} Mini:Micro ratio"
                 + (f" and lasted at least {min_duration_seconds} seconds." if min_duration_seconds > 0 else ".")
             )
-
-            st.subheader("Detailed per-symbol overexposure (color-coded)")
 
             detail_df = pd.DataFrame(detail_rows)
 
@@ -365,6 +400,7 @@ if uploaded_file is not None:
 
             styled_detail = detail_df.style.apply(color_rows, axis=1)
 
+            st.subheader("Detailed per-symbol overexposure (color-coded)")
             st.dataframe(styled_detail, use_container_width=True)
 
             st.caption(
@@ -374,7 +410,134 @@ if uploaded_file is not None:
                 f"under the selected {ratio_option} Mini:Micro ratio."
             )
 
+            # --- Cross-link overexposed intervals to trades -------------------
+            overexposed_trade_indices = set()
+            intervals_df = pd.DataFrame(intervals_summary)
+
+            st.subheader("Overexposed intervals with matching trades")
+
+            for gid in sorted(intervals_df["Group ID"].unique()):
+                inter_row = intervals_df[intervals_df["Group ID"] == gid].iloc[0]
+                start = inter_row["Interval Start"]
+                end = inter_row["Interval End"]
+
+                # Trades whose lifespan overlaps this interval
+                mask = (trades_df["Open_dt"] < end) & (trades_df["Close_dt"] > start)
+                trades_for_interval = trades_df[mask].copy()
+                overexposed_trade_indices.update(trades_for_interval.index.tolist())
+
+                with st.expander(
+                    f"Interval {gid}: {start} → {end} "
+                    f"(Exposure: {inter_row['Total Mini-Equiv Exposure']:.2f})"
+                ):
+                    st.markdown("**Exposure snapshot (per symbol)**")
+                    exp_rows = detail_df[detail_df["Group ID"] == gid].copy()
+                    exp_cols = [
+                        "Symbol",
+                        "Root Code",
+                        "Position Contracts",
+                        "Mini-Equiv Weight",
+                        "Mini-Equiv Exposure",
+                        "Duration (sec)",
+                    ]
+                    st.dataframe(exp_rows[exp_cols], use_container_width=True)
+
+                    st.markdown("**Trades overlapping this interval**")
+                    if trades_for_interval.empty:
+                        st.info("No trades from the trades export overlap this interval.")
+                    else:
+                        # Prepare trade detail: Bias, Size Type, Net PnL, etc.
+                        trade_cols = [
+                            "Symbol",
+                            "Root Code",
+                            "Size Type",
+                            "Bias",
+                            "Volume",
+                            "Open Time",
+                            "Close Time",
+                            "Duration",
+                            "Net Profit",
+                            "NetProfit_val",
+                        ]
+                        existing_trade_cols = [c for c in trade_cols if c in trades_for_interval.columns]
+                        st.dataframe(
+                            trades_for_interval[existing_trade_cols].sort_values("Open_dt"),
+                            use_container_width=True,
+                        )
+                        st.caption(
+                            "Each trade shows its **Bias** (LONG/SHORT) and whether it is "
+                            "**Mini or Micro** (Size Type), based on the root Code."
+                        )
+
+        # --- Net PnL summary from trades -------------------------------------
+        st.subheader("Net PnL Summary (from trades export)")
+
+        if "NetProfit_val" in trades_df.columns and trades_df["NetProfit_val"].notna().any():
+            total_net_pnl = trades_df["NetProfit_val"].sum()
+
+            pnl_overexposed_trades = trades_df.loc[
+                list(overexposed_trade_indices), "NetProfit_val"
+            ].sum() if overexposed_trade_indices else 0.0
+
+            col1, col2 = st.columns(2)
+            col1.metric(
+                "Total Net PnL (all trades)",
+                f"{total_net_pnl:,.2f}",
+                help="Sum of Net Profit from the trades export.",
+            )
+            col2.metric(
+                "Net PnL from overexposed trades",
+                f"{pnl_overexposed_trades:,.2f}",
+                help=(
+                    "Sum of Net Profit from trades that overlapped at least one "
+                    "overexposure interval under the current settings."
+                ),
+            )
+
+            # Detailed Net PnL per trade, flagging overexposed ones
+            st.subheader("Trades detail with Net PnL and overexposure flag")
+
+            trades_df["Involved in Overexposure"] = trades_df.index.isin(
+                overexposed_trade_indices
+            )
+            trades_detail_cols = [
+                "Symbol",
+                "Root Code",
+                "Size Type",
+                "Bias",
+                "Volume",
+                "Open Time",
+                "Close Time",
+                "Duration",
+                "Net Profit",
+                "NetProfit_val",
+                "Involved in Overexposure",
+            ]
+            existing_cols = [c for c in trades_detail_cols if c in trades_df.columns]
+            trades_detail_df = trades_df[existing_cols].copy()
+
+            st.dataframe(
+                trades_detail_df.sort_values(
+                    ["Involved in Overexposure", "Open_dt"],
+                    ascending=[False, True],
+                ),
+                use_container_width=True,
+            )
+
+            st.caption(
+                "Net PnL is taken directly from the trades export (**Net Profit**). "
+                "Trades flagged as 'Involved in Overexposure' are those whose "
+                "lifespan overlapped at least one overexposed interval. "
+                "Each trade shows its **Bias** and whether it is **Mini or Micro**."
+            )
+        else:
+            st.warning(
+                "No valid 'Net Profit' column found in the trades CSV, so Net PnL "
+                "could not be computed. Make sure your trades export includes "
+                "a 'Net Profit' column."
+            )
+
     except Exception as e:
-        st.error(f"Error processing file: {e}")
+        st.error(f"Error processing files: {e}")
 else:
-    st.info("Upload a fills CSV to begin.")
+    st.info("Upload **both** a fills CSV and a trades CSV to begin.")

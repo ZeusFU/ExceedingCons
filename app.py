@@ -1,39 +1,17 @@
 import streamlit as st
 import pandas as pd
+import streamlit.components.v1 as components
 
 st.title("Overexposure & Net PnL Analyzer (Fills + Trades)")
 
 st.write(
     """
-    Upload **both** a fills CSV and a trades CSV (like Tradovate exports), then:
-
-    1. Choose the **Mini:Micro contract ratio** for this account (1:1, 1:5, 1:10).
-    2. Enter the **max allowed simultaneous exposure in mini-equivalents**.
-    3. Set a **minimum overexposure duration (seconds)** for the
-       "Overexposure ≥ Xs" view.
-
-    The app will:
-
-    - Use the **root Code** (e.g. NQ/MNQ, ES/MES, MGC, SIL, MBT, MET).
-    - Classify each product as **mini** or **micro** (MBT & MET treated as minis).
-    - Apply mini-equivalent weights:
-        - Minis (and MBT/MET): 1.0 mini-equivalent per contract.
-        - Micros: (1 / chosen ratio) mini-equivalent per contract.
-    - Reconstruct positions over time from fills and detect intervals where
-      **total mini-equivalent exposure exceeds the max**.
-    - Compute:
-        - All overexposed intervals (no duration filter).
-        - Overexposed intervals lasting **≥ X seconds**.
-    - Cross-link those intervals to **trades** by time overlap.
-    - Use **Net PnL** from the trades export to summarize:
-        - Total Net PnL (all trades)
-        - Net PnL from all overexposure
-        - Net PnL from overexposure ≥ X seconds
-        - Overexposure ≥ Xs as % of total Net PnL
-    - For each overexposed interval (≥ Xs), show:
-        - Exposure snapshot (per symbol)
-        - Overlapping trades with **Bias** and **Mini/Micro** classification.
-    - At the end, prepare a **top-3 overexposure narrative copy** ready to paste.
+    Upload your fills and trades exports, set your exposure and duration
+    parameters, and this app will:
+    - Detect overexposure intervals from fills,
+    - Link them to trades and Net PnL,
+    - Summarize the impact, and
+    - Generate a ready-to-paste written summary.
     """
 )
 
@@ -383,6 +361,76 @@ if fills_file is not None and trades_file is not None:
             mask_f = (trades_df["Open_dt"] < end_f) & (trades_df["Close_dt"] > start_f)
             overexposed_trade_indices_filtered.update(trades_df[mask_f].index.tolist())
 
+        # --- Net PnL summary from trades (TOP SECTION) ------------------------
+        st.subheader("Net PnL Summary")
+
+        total_net_pnl = None
+        pnl_overexposure_all = None
+        pnl_overexposure_filtered = None
+        perc_overexposure = None
+        num_overexposed_trades_all = 0
+        num_overexposed_trades_filtered = 0
+
+        if "NetProfit_val" in trades_df.columns and trades_df["NetProfit_val"].notna().any():
+            total_net_pnl = trades_df["NetProfit_val"].sum()
+
+            # Unique trades involved in ANY overexposure interval
+            num_overexposed_trades_all = len(overexposed_trade_indices_all)
+            pnl_overexposure_all = (
+                trades_df.loc[list(overexposed_trade_indices_all), "NetProfit_val"].sum()
+                if overexposed_trade_indices_all
+                else 0.0
+            )
+
+            # Unique trades involved in overexposure intervals that meet duration threshold
+            num_overexposed_trades_filtered = len(overexposed_trade_indices_filtered)
+            pnl_overexposure_filtered = (
+                trades_df.loc[list(overexposed_trade_indices_filtered), "NetProfit_val"].sum()
+                if overexposed_trade_indices_filtered
+                else 0.0
+            )
+
+            # Overexposure as % of total (based on duration-filtered PnL)
+            if total_net_pnl != 0:
+                perc_overexposure = 100.0 * (pnl_overexposure_filtered / total_net_pnl)
+            else:
+                perc_overexposure = 0.0
+
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric(
+                "Total Net PnL (all trades)",
+                f"{total_net_pnl:,.2f}",
+            )
+            col2.metric(
+                "Net PnL from all overexposure",
+                f"{pnl_overexposure_all:,.2f}",
+            )
+            col3.metric(
+                f"Net PnL from overexposure ≥ {min_duration_seconds}s",
+                f"{pnl_overexposure_filtered:,.2f}",
+            )
+            col4.metric(
+                f"Overexposure ≥ {min_duration_seconds}s as % of total PnL",
+                f"{perc_overexposure:,.2f}%",
+            )
+
+            col5, col6 = st.columns(2)
+            col5.metric(
+                "Number of trades involved in any overexposure",
+                f"{num_overexposed_trades_all}",
+            )
+            col6.metric(
+                f"Number of trades involved in overexposure ≥ {min_duration_seconds}s",
+                f"{num_overexposed_trades_filtered}",
+            )
+
+        else:
+            st.warning(
+                "No valid 'Net Profit' column found in the trades CSV, so Net PnL "
+                "could not be computed. Make sure your trades export includes "
+                "a 'Net Profit' column."
+            )
+
         # --- Overexposed intervals with matching trades (only filtered ones) ---
         st.subheader("Overexposed intervals with matching trades")
 
@@ -452,74 +500,6 @@ if fills_file is not None and trades_file is not None:
                             "Each trade shows its **Bias** (LONG/SHORT) and whether it is "
                             "**Mini or Micro** (Size Type), based on the root Code."
                         )
-
-        # --- Net PnL summary from trades --------------------------------------
-        st.subheader("Net PnL Summary (from trades export)")
-
-        total_net_pnl = None
-        pnl_overexposure_all = None
-        pnl_overexposure_filtered = None
-        perc_overexposure = None
-
-        if "NetProfit_val" in trades_df.columns and trades_df["NetProfit_val"].notna().any():
-            total_net_pnl = trades_df["NetProfit_val"].sum()
-
-            # PnL from trades involved in ANY overexposure interval (ignoring duration threshold)
-            pnl_overexposure_all = (
-                trades_df.loc[list(overexposed_trade_indices_all), "NetProfit_val"].sum()
-                if overexposed_trade_indices_all
-                else 0.0
-            )
-
-            # PnL from trades involved in overexposure intervals that meet duration threshold
-            pnl_overexposure_filtered = (
-                trades_df.loc[list(overexposed_trade_indices_filtered), "NetProfit_val"].sum()
-                if overexposed_trade_indices_filtered
-                else 0.0
-            )
-
-            # Overexposure as % of total (based on duration-filtered PnL)
-            if total_net_pnl != 0:
-                perc_overexposure = 100.0 * (pnl_overexposure_filtered / total_net_pnl)
-            else:
-                perc_overexposure = 0.0
-
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric(
-                "Total Net PnL (all trades)",
-                f"{total_net_pnl:,.2f}",
-                help="Sum of Net Profit from the trades export.",
-            )
-            col2.metric(
-                "Net PnL from all overexposure",
-                f"{pnl_overexposure_all:,.2f}",
-                help=(
-                    "Sum of Net Profit from trades that overlapped at least one "
-                    "overexposed interval (regardless of duration)."
-                ),
-            )
-            col3.metric(
-                f"Net PnL from overexposure ≥ {min_duration_seconds}s",
-                f"{pnl_overexposure_filtered:,.2f}",
-                help=(
-                    "Sum of Net Profit from trades that overlapped at least one "
-                    f"overexposed interval lasting ≥ {min_duration_seconds} seconds."
-                ),
-            )
-            col4.metric(
-                f"Overexposure ≥ {min_duration_seconds}s as % of total PnL",
-                f"{perc_overexposure:,.2f}%",
-                help=(
-                    "Net PnL from overexposure intervals (≥ duration threshold) "
-                    "as a percentage of total Net PnL."
-                ),
-            )
-        else:
-            st.warning(
-                "No valid 'Net Profit' column found in the trades CSV, so Net PnL "
-                "could not be computed. Make sure your trades export includes "
-                "a 'Net Profit' column."
-            )
 
         # --- Prepared copy for top-3 overexposures ----------------------------
         st.subheader("Prepared overexposure summary copy")
@@ -609,7 +589,7 @@ if fills_file is not None and trades_file is not None:
                         close_dt = trow.get("Close_dt")
 
                         if pd.notna(open_dt):
-                            copy_lines.append(f"")
+                            copy_lines.append("")
                             copy_lines.append(f"Opened: {fmt_trade_time(open_dt)}")
                         if pd.notna(close_dt):
                             copy_lines.append(f"Closed: {fmt_trade_time(close_dt)}")
@@ -617,7 +597,7 @@ if fills_file is not None and trades_file is not None:
 
             # Concluding lines
             # Use max_mini_equiv as the limit in the narrative
-            limit_val = int(max_mini_equiv) if max_mini_equiv.is_integer() else max_mini_equiv
+            limit_val = int(max_mini_equiv) if float(max_mini_equiv).is_integer() else max_mini_equiv
             copy_lines.append(
                 f"This exceeds the maximum allowed limit of {limit_val} contracts under the Cross-Instrument Policy based on your account plan limit."
             )
@@ -629,10 +609,34 @@ if fills_file is not None and trades_file is not None:
 
             final_copy = "\n".join(copy_lines)
 
+            # Show copy in a text area
             st.text_area(
                 "Copy (ready to paste):",
                 value=final_copy,
                 height=400,
+                key="final_copy_area",
+            )
+
+            # Copy to clipboard button (via a bit of HTML/JS)
+            escaped_copy = (
+                final_copy.replace("\\", "\\\\")
+                .replace("`", "\\`")
+                .replace("</", "<\\/")
+            )
+
+            components.html(
+                f"""
+                <script>
+                function copyToClipboard() {{
+                    const text = `{escaped_copy}`;
+                    navigator.clipboard.writeText(text);
+                }}
+                </script>
+                <button onclick="copyToClipboard()" style="margin-top: 8px; padding: 6px 12px; border-radius: 4px; border: 1px solid #ccc; cursor: pointer;">
+                    Copy to clipboard
+                </button>
+                """,
+                height=60,
             )
 
     except Exception as e:

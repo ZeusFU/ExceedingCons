@@ -287,6 +287,54 @@ def get_account_id(trades_df: pd.DataFrame) -> str:
     return account_id
 
 
+def build_position_segments(cleaned_fills: pd.DataFrame):
+    """
+    Build position segments per symbol from fills:
+    segments where net position != 0 (from first non-zero to return to zero).
+
+    Returns:
+        segments_by_symbol: dict[symbol] -> list of dicts {start, end}
+    """
+    segments_by_symbol = {}
+    if cleaned_fills.empty:
+        return segments_by_symbol
+
+    for asset, group in cleaned_fills.groupby("asset"):
+        g = group.sort_values("timestamp_dt")
+        pos = 0.0
+        seg_start = None
+        segments = []
+
+        for _, row in g.iterrows():
+            ts = row["timestamp_dt"]
+            qty = row["quantity"]
+            action = str(row["action"]).strip().lower()
+
+            delta = qty if action == "buy" else -qty if action == "sell" else 0.0
+            pos_before = pos
+            pos_after = pos_before + delta
+
+            # Start of a segment: going 0 -> non-zero
+            if pos_before == 0 and pos_after != 0:
+                seg_start = ts
+
+            # End of a segment: going non-zero -> 0
+            if pos_before != 0 and pos_after == 0 and seg_start is not None:
+                segments.append({"start": seg_start, "end": ts})
+                seg_start = None
+
+            pos = pos_after
+
+        # If still open at the end of data, close segment at last timestamp
+        if seg_start is not None:
+            last_ts = g["timestamp_dt"].max()
+            segments.append({"start": seg_start, "end": last_ts})
+
+        segments_by_symbol[asset] = segments
+
+    return segments_by_symbol
+
+
 if fills_file is not None and trades_file is not None:
     try:
         fills_df = pd.read_csv(fills_file)
@@ -298,6 +346,9 @@ if fills_file is not None and trades_file is not None:
             max_mini_equiv=max_mini_equiv,
             micro_weight=micro_weight_global,
         )
+
+        # Build position segments from fills (for email copy)
+        segments_by_symbol = build_position_segments(cleaned_fills)
 
         # --- Trades preprocessing ---------------------------------------------
         trades_df = trades_df.copy()
@@ -501,8 +552,8 @@ if fills_file is not None and trades_file is not None:
                             "**Mini or Micro** (Size Type), based on the root Code."
                         )
 
-        # --- Prepared copy for top-3 overexposures ----------------------------
-        st.subheader("Prepared overexposure summary copy")
+        # --- Prepared copy for top-3 overexposures (based on fills) -----------
+        st.subheader("Prepared overexposure summary copy (based on fills)")
 
         if intervals_df_all.empty:
             st.info("No overexposure intervals detected; no copy can be prepared.")
@@ -518,6 +569,10 @@ if fills_file is not None and trades_file is not None:
             base_df = base_df.sort_values(
                 "Total Mini-Equiv Exposure", ascending=False
             ).head(3)
+
+            # Use detail rows matching those intervals
+            base_group_ids = set(base_df["Group ID"].unique())
+            base_detail_df = detail_df_all[detail_df_all["Group ID"].isin(base_group_ids)].copy()
 
             # Account ID & reference date
             account_id = get_account_id(trades_df)
@@ -541,6 +596,18 @@ if fills_file is not None and trades_file is not None:
                 # Example: Dec 17, 03:32:17 AM EST
                 return dt.strftime("%b %d, %I:%M:%S %p EST")
 
+            # Function: get segment open/close times from fills for a symbol
+            def get_segment_times_for_symbol(symbol, interval_start):
+                segs = segments_by_symbol.get(symbol, [])
+                for seg in segs:
+                    # segment covering the interval start
+                    if seg["start"] <= interval_start <= seg["end"]:
+                        return seg["start"], seg["end"]
+                # fallback: no matching segment found
+                if segs:
+                    return segs[0]["start"], segs[-1]["end"]
+                return None, None
+
             # For each selected overexposure instance
             for idx, (_, inter_row) in enumerate(base_df.iterrows()):
                 start = inter_row["Interval Start"]
@@ -560,39 +627,32 @@ if fills_file is not None and trades_file is not None:
 
                 copy_lines.append("")
 
-                # Trades overlapping this interval
-                mask = (trades_df["Open_dt"] < end) & (trades_df["Close_dt"] > start)
-                trades_for_interval = trades_df[mask].copy()
+                # Fills-based exposures in this interval
+                exp_rows = base_detail_df[base_detail_df["Group ID"] == inter_row["Group ID"]].copy()
 
-                if trades_for_interval.empty:
-                    copy_lines.append("(No matching trades found in the trades export.)")
+                if exp_rows.empty:
+                    copy_lines.append("(No reconstructed positions found for this interval.)")
                     copy_lines.append("")
                 else:
-                    # For each trade, list contracts & open/close times
-                    trades_for_interval = trades_for_interval.sort_values("Open_dt")
-                    for _, trow in trades_for_interval.iterrows():
-                        symbol = trow.get("Symbol", "")
-                        size_type = trow.get("Size Type", "Mini")
-                        size_word = "Mini" if str(size_type).lower().startswith("mini") else "Micro"
+                    for _, erow in exp_rows.iterrows():
+                        symbol = erow["Symbol"]
+                        root = erow["Root Code"]
+                        contracts = erow["Position Contracts"]
 
-                        volume = trow.get("Volume", "")
-                        try:
-                            if pd.isna(volume):
-                                volume_str = "X"
-                            else:
-                                volume_str = str(int(float(volume)))
-                        except Exception:
-                            volume_str = str(volume) if volume not in ("", None) else "X"
+                        # Mini vs Micro from root
+                        size_type = ROOT_TYPES.get(root, "mini")
+                        size_word = "Mini" if size_type == "mini" else "Micro"
 
-                        copy_lines.append(f"{volume_str} {size_word} contracts – {symbol}")
-                        open_dt = trow.get("Open_dt")
-                        close_dt = trow.get("Close_dt")
+                        # Segment open / close from fills
+                        seg_open, seg_close = get_segment_times_for_symbol(symbol, start)
 
-                        if pd.notna(open_dt):
+                        copy_lines.append(f"{contracts} {size_word} contracts – {symbol}")
+
+                        if seg_open is not None:
                             copy_lines.append("")
-                            copy_lines.append(f"Opened: {fmt_trade_time(open_dt)}")
-                        if pd.notna(close_dt):
-                            copy_lines.append(f"Closed: {fmt_trade_time(close_dt)}")
+                            copy_lines.append(f"Opened: {fmt_trade_time(seg_open)}")
+                        if seg_close is not None:
+                            copy_lines.append(f"Closed: {fmt_trade_time(seg_close)}")
                         copy_lines.append("")
 
             # Concluding lines

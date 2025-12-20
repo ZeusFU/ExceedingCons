@@ -29,7 +29,7 @@ st.write(
         - Total Net PnL for all trades.
         - Net PnL from trades that were involved in overexposure.
     - In the trades detail:
-        - Show **Bias** (SHORT / LONG).
+        - Show **Bias** (LONG / SHORT).
         - Indicate whether each trade is **Mini or Micro**.
     """
 )
@@ -71,13 +71,6 @@ min_duration_seconds = st.number_input(
 # --------------------------------------------------------------------
 # Root Code classification using instrument list logic
 # --------------------------------------------------------------------
-# We'll classify each root as:
-#   "mini"  -> 1.0 mini-equivalent per contract
-#   "micro" -> micro_weight_global mini-equivalent per contract
-#
-# MBT and MET are treated as "mini" for risk purposes, even though
-# they are named Micro products.
-
 MINI_ROOTS = [
     # CME FX & index minis
     "6A", "6B", "6C", "6E", "6J", "6N", "6S",
@@ -277,6 +270,33 @@ def parse_money_to_float(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series.astype(str).str.replace("[$,]", "", regex=True), errors="coerce")
 
 
+def infer_bias_column(df: pd.DataFrame) -> pd.Series:
+    """
+    Best-effort inference of LONG/SHORT bias per trade.
+    Looks for columns like 'Side', 'Direction', or 'Bias'.
+    """
+    bias_source_col = None
+    for col in df.columns:
+        lc = col.lower()
+        if "side" in lc or "direction" in lc or "bias" in lc:
+            bias_source_col = col
+            break
+
+    def map_bias(val):
+        v = str(val).strip().lower()
+        if v in ["long", "buy", "b"]:
+            return "LONG"
+        if v in ["short", "sell", "s"]:
+            return "SHORT"
+        return "UNKNOWN"
+
+    if bias_source_col is not None:
+        return df[bias_source_col].map(map_bias)
+    else:
+        # Fallback: unknown if we can't find any directional column
+        return pd.Series(["UNKNOWN"] * len(df), index=df.index)
+
+
 if fills_file is not None and trades_file is not None:
     try:
         fills_df = pd.read_csv(fills_file)
@@ -307,11 +327,12 @@ if fills_file is not None and trades_file is not None:
         )
 
         # --- Trades preprocessing ---------------------------------------------
-        # Parse datetimes
         trades_df = trades_df.copy()
         trades_df["Open_dt"] = pd.to_datetime(trades_df["Open Time"], errors="coerce")
         trades_df["Close_dt"] = pd.to_datetime(trades_df["Close Time"], errors="coerce")
-        # Parse Net PnL from string like "$190.50"
+        trades_df["Duration_sec"] = (trades_df["Close_dt"] - trades_df["Open_dt"]).dt.total_seconds()
+
+        # Net PnL
         if "Net Profit" in trades_df.columns:
             trades_df["NetProfit_val"] = parse_money_to_float(trades_df["Net Profit"])
         else:
@@ -322,6 +343,9 @@ if fills_file is not None and trades_file is not None:
         trades_df["Size Type"] = trades_df["Root Code"].apply(
             lambda r: "Micro" if ROOT_TYPES.get(r, "mini") == "micro" else "Mini"
         )
+
+        # Bias (LONG / SHORT / UNKNOWN)
+        trades_df["Bias"] = infer_bias_column(trades_df)
 
         # --- Instrument mapping summary (from fills) --------------------------
         st.subheader("Instrument root codes & mini-equivalent weights (under selected ratio)")
@@ -455,13 +479,16 @@ if fills_file is not None and trades_file is not None:
                             "Volume",
                             "Open Time",
                             "Close Time",
-                            "Duration",
+                            "Duration_sec",
                             "Net Profit",
                             "NetProfit_val",
+                            "Open_dt",  # keep for sorting
                         ]
                         existing_trade_cols = [c for c in trade_cols if c in trades_for_interval.columns]
+
+                        display_df = trades_for_interval.sort_values("Open_dt")
                         st.dataframe(
-                            trades_for_interval[existing_trade_cols].sort_values("Open_dt"),
+                            display_df[existing_trade_cols],
                             use_container_width=True,
                         )
                         st.caption(
@@ -508,19 +535,22 @@ if fills_file is not None and trades_file is not None:
                 "Volume",
                 "Open Time",
                 "Close Time",
-                "Duration",
+                "Duration_sec",
                 "Net Profit",
                 "NetProfit_val",
                 "Involved in Overexposure",
+                "Open_dt",
             ]
             existing_cols = [c for c in trades_detail_cols if c in trades_df.columns]
             trades_detail_df = trades_df[existing_cols].copy()
 
+            trades_detail_df = trades_detail_df.sort_values(
+                ["Involved in Overexposure", "Open_dt"],
+                ascending=[False, True],
+            )
+
             st.dataframe(
-                trades_detail_df.sort_values(
-                    ["Involved in Overexposure", "Open_dt"],
-                    ascending=[False, True],
-                ),
+                trades_detail_df,
                 use_container_width=True,
             )
 
